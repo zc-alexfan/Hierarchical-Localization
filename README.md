@@ -1,5 +1,7 @@
 # hloc - the hierarchical localization toolbox
 
+> Acknowledgement: Source code is from [hloc](https://github.com/cvg/Hierarchical-Localization). We adapted it for object pose estimation in [HOLD](https://github.com/zc-alexfan/hold). If you find [HOLD](https://github.com/zc-alexfan/hold) useful, consider citing hloc as well.
+
 This is `hloc`, a modular toolbox for state-of-the-art 6-DoF visual localization. It implements [Hierarchical Localization](https://arxiv.org/abs/1812.03506), leveraging image retrieval and feature matching, and is fast, accurate, and scalable. This codebase combines and makes easily accessible years of research on image matching and Structure-from-Motion.
 
 With `hloc`, you can:
