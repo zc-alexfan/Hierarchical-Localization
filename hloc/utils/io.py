@@ -19,6 +19,15 @@ def read_image(path, grayscale=False):
         image = image[:, :, ::-1]  # BGR to RGB
     return image
 
+def read_mask(path):
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image.shape[2] == 4:
+        mask = image[:, :, 3]
+        _, binary_mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+        mask = binary_mask / 255
+    else:
+        mask = np.ones_like(image[:, :, 0])
+    return mask
 
 def list_h5_names(path):
     names = []

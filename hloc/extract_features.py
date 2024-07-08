@@ -15,7 +15,9 @@ import glob
 from . import extractors, logger
 from .utils.base_model import dynamic_load
 from .utils.parsers import parse_image_lists
-from .utils.io import read_image, list_h5_names
+from .utils.io import read_image, list_h5_names, read_mask
+from .utils.viz import plot_images, plot_keypoints
+import matplotlib.pyplot as plt
 
 
 '''
@@ -201,24 +203,27 @@ class ImageDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         name = self.names[idx]
         image = read_image(self.root / name, self.conf.grayscale)
+        mask = read_mask(self.root / name)
         image = image.astype(np.float32)
         size = image.shape[:2][::-1]
 
-        if self.conf.resize_max and (self.conf.resize_force
-                                     or max(size) > self.conf.resize_max):
+        if self.conf.resize_max and (
+            self.conf.resize_force or max(size) > self.conf.resize_max
+        ):
             scale = self.conf.resize_max / max(size)
-            size_new = tuple(int(round(x*scale)) for x in size)
+            size_new = tuple(int(round(x * scale)) for x in size)
             image = resize_image(image, size_new, self.conf.interpolation)
 
         if self.conf.grayscale:
             image = image[None]
         else:
             image = image.transpose((2, 0, 1))  # HxWxC to CxHxW
-        image = image / 255.
+        image = image / 255.0
 
         data = {
-            'image': image,
-            'original_size': np.array(size),
+            "image": image,
+            "mask": mask,
+            "original_size": np.array(size),
         }
         return data
 
@@ -233,7 +238,10 @@ def main(conf: Dict,
          as_half: bool = True,
          image_list: Optional[Union[Path, List[str]]] = None,
          feature_path: Optional[Path] = None,
-         overwrite: bool = False) -> Path:
+         overwrite: bool = False,
+         mask_dilate: int = 3,
+         debug: bool = False,
+) -> Path:
     logger.info('Extracting local features with configuration:'
                 f'\n{pprint.pformat(conf)}')
 
@@ -256,7 +264,48 @@ def main(conf: Dict,
         dataset, num_workers=1, shuffle=False, pin_memory=True)
     for idx, data in enumerate(tqdm(loader)):
         name = dataset.names[idx]
+        mask = data["mask"][0].to(device)
         pred = model({'image': data['image'].to(device, non_blocking=True)})
+        if 'keypoints' in pred:
+            if debug:
+                plot_images([read_image(image_dir / name)], dpi=255, titles=[f"{name} kp"])
+                plot_keypoints([pred["keypoints"][0].cpu().numpy()], colors=[(0, 0, 1)], ps=4)
+                plt.show()
+            indices = []
+            pred_n = {}
+            for index, kp in enumerate(pred["keypoints"][0]):
+                col, row  = kp.int()
+                col_min = max(0, int(col - mask_dilate))
+                col_max = min(mask.shape[0], int(col + mask_dilate))
+                mask_row = np.nonzero(mask[row])
+                if mask_row.numel() == 0:
+                    # skip keypoints outside the mask
+                    continue
+                mask_b_1, mask_b_2 = mask_row[0], mask_row[-1]
+                if mask_b_1 in range(col_min, col_max) or mask_b_2 in range(col_min, col_max) or  col < mask_b_1 or col > mask_b_2:
+                    # skip keypoints that are on the mask
+                    continue
+                indices.append(index)
+            try:
+                pred_n["keypoints"] = [pred["keypoints"][0][i] for i in indices]
+                pred["keypoints"] = [torch.stack(pred_n["keypoints"])]
+                pred_n["descriptors"] = [pred["descriptors"][0][:,i] for i in indices]
+                pred["descriptors"] = [torch.stack(pred_n["descriptors"]).permute(1, 0)]
+                if 'keypoint_scores' in pred:
+                    pred_n["keypoint_scores"] = [pred["keypoint_scores"][0][i] for i in indices]
+                    pred["keypoint_scores"] = [torch.stack(pred_n["keypoint_scores"])]
+                elif 'scores' in pred:
+                    pred_n["scores"] = [pred["scores"][0][i] for i in indices]
+                    pred["scores"] = [torch.stack(pred_n["scores"])]
+            except IndexError:
+                breakpoint()
+                print(f"Skipping image {name} as all keypoints are on the mask.")
+            if debug:
+                plot_images([read_image(image_dir / name)], dpi=255, titles=[f"{name} kp"])
+                plot_keypoints([pred["keypoints"][0].cpu().numpy()], colors=[(0, 0, 1)], ps=4)
+                plt.show()
+
+                
         pred = {k: v[0].cpu().numpy() for k, v in pred.items()}
 
         pred['image_size'] = original_size = data['original_size'][0].numpy()
