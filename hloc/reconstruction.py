@@ -4,6 +4,8 @@ from typing import Optional, List, Dict, Any
 import multiprocessing
 from pathlib import Path
 import pycolmap
+import os.path as osp
+import numpy as np
 
 from . import logger
 from .utils.database import COLMAPDatabase
@@ -22,6 +24,49 @@ def create_empty_db(database_path: Path):
     db.commit()
     db.close()
 
+def load_intrin_to_database(output_db_path, intrin_prior_path, colmap_cfgs=None):
+    assert osp.exists(intrin_prior_path)
+    single_camera = False
+    if colmap_cfgs is not None and "ImageReader_single_camera" in colmap_cfgs:
+        if colmap_cfgs["ImageReader_single_camera"]:
+            single_camera = True
+
+    db = COLMAPDatabase.connect(output_db_path)
+    # Check num of camera:
+    rows = db.execute("SELECT camera_id FROM cameras")
+    camera_ids = [id[0] for id in rows]
+    if len(camera_ids) == 1:
+        assert osp.isfile(intrin_prior_path) and single_camera, f"single_camera is switched, however given a intrin directory"
+
+        row = db.execute(f"SELECT width, height FROM cameras WHERE camera_id = {camera_ids[0]}")
+        w, h = next(row)
+        db.execute(f"DELETE FROM cameras WHERE camera_id = {camera_ids[0]}")
+
+        K = np.loadtxt(intrin_prior_path) # 3*3
+        fx, fy, cx, cy = K[0][0], K[1][1], K[0, 2], K[1, 2]
+
+        db.add_camera(1, w, h, np.array((fx, fy, cx, cy)), camera_id=camera_ids[0])
+
+    else:
+        # Load image name, camera id from images:
+        for image_name, camera_id in db.execute("SELECT name, camera_id FROM images"):
+            # Delete camera:
+            row = db.execute(f"SELECT width, height FROM cameras WHERE camera_id = {camera_id}")
+            w, h = next(row)
+            db.execute(f"DELETE FROM cameras WHERE camera_id = {camera_id}")
+
+            # Then add new camera:
+            img_base_name = osp.splitext(osp.basename(image_name))[0]
+            assert osp.isdir(intrin_prior_path), f"Provided intrinsics path is not a directory! You need to switch single_camera for providing only one intrinsic file "
+
+            intrin_prior_file_path = osp.join(intrin_prior_path, img_base_name+'.txt')
+            K = np.loadtxt(intrin_prior_file_path)
+            fx, fy, cx, cy = K[0][0], K[1][1], K[0, 2], K[1, 2]
+
+            db.add_camera(1, w, h, np.array((fx, fy, cx, cy)), camera_id=camera_id)
+
+    db.commit()
+    db.close()
 
 def import_images(image_dir: Path,
                   database_path: Path,
@@ -53,18 +98,21 @@ def run_reconstruction(sfm_dir: Path,
                        database_path: Path,
                        image_dir: Path,
                        verbose: bool = False,
-                       options: Optional[Dict[str, Any]] = None,
+                       colmap_configs: Optional[Dict[str, Any]] = None,
                        ) -> pycolmap.Reconstruction:
     models_path = sfm_dir / 'models'
     models_path.mkdir(exist_ok=True, parents=True)
     logger.info('Running 3D reconstruction...')
-    if options is None:
-        options = {}
-    options = {'num_threads': min(multiprocessing.cpu_count(), 16), **options}
+    if colmap_configs is None:
+        colmap_configs = {}
+    # options = {'num_threads': min(multiprocessing.cpu_count(), 16), **options}
+    mapper_options = pycolmap.IncrementalMapperOptions(ba_global_use_pba=colmap_configs['use_pba'], ba_refine_focal_length=not colmap_configs['no_refine_intrinsics'], ba_refine_extra_params=not colmap_configs['no_refine_intrinsics'], num_threads=min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16))
     with OutputCapture(verbose):
         with pycolmap.ostream():
+            logger.info(f"use: {min(multiprocessing.cpu_count(), colmap_configs['n_threads'] if 'n_threads' in colmap_configs else 16)} cpus")
+            logger.info(mapper_options.summary())
             reconstructions = pycolmap.incremental_mapping(
-                database_path, image_dir, models_path, options=options)
+                database_path, image_dir, models_path, options=mapper_options)
 
     if len(reconstructions) == 0:
         logger.error('Could not reconstruct any model!')
@@ -92,6 +140,7 @@ def run_reconstruction(sfm_dir: Path,
 
 def main(sfm_dir: Path,
          image_dir: Path,
+         intrinsic_f: Path,
          pairs: Path,
          features: Path,
          matches: Path,
@@ -113,6 +162,16 @@ def main(sfm_dir: Path,
 
     create_empty_db(database)
     import_images(image_dir, database, camera_mode, image_list, image_options)
+    colmap_configs = {'ImageReader_single_camera': True, 
+                      'min_model_size': 3, 
+                      'filter_max_reproj_error': 4, 
+                      'no_refine_intrinsics': True, 
+                      'ImageReader_camera_mode': 'single_camera', 
+                      'use_pba': False, 
+                      'n_threads': 16, 
+                      'reregistration': {'abs_pose_max_error': 12, 'abs_pose_min_num_inliers': 30, 'abs_pose_min_inlier_ratio': 0.25, 'filter_max_reproj_error': 5}, 
+                      'colmap_mapper_cfgs': None}
+    load_intrin_to_database(database, intrinsic_f, colmap_configs)
     image_ids = get_image_ids(database)
     import_features(image_ids, database, features)
     import_matches(image_ids, database, pairs, matches,
@@ -120,7 +179,7 @@ def main(sfm_dir: Path,
     if not skip_geometric_verification:
         estimation_and_geometric_verification(database, pairs, verbose)
     reconstruction = run_reconstruction(
-        sfm_dir, database, image_dir, verbose, mapper_options)
+        sfm_dir, database, image_dir, verbose, colmap_configs)
     if reconstruction is not None:
         logger.info(f'Reconstruction statistics:\n{reconstruction.summary()}'
                     + f'\n\tnum_input_images = {len(image_ids)}')
